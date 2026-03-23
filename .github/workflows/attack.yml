@@ -19,7 +19,7 @@ on:
       threads:
         description: 'Threads per worker'
         required: true
-        default: '2000'
+        default: '10000'
 
 jobs:
   attack:
