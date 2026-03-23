@@ -1,4 +1,5 @@
- name: VPS Attack
+name: VPS Attack
+
 on:
   workflow_dispatch:
     inputs:
